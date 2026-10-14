@@ -1,6 +1,4 @@
--- Mesa Teacher Loop 1.3.0. Active source; run manually through Mesa MCP.
--- Native walking between stages; no teleports, fabricated rewards or autoexec.
--- Silent: no console output. Read getgenv().MesaTeacherLoop.history / :Report() instead.
+
 if game.PlaceId ~= 185655149 then return end
 local env = getgenv()
 if env.MesaTeacherLoop then env.MesaTeacherLoop:Stop('replaced') end
