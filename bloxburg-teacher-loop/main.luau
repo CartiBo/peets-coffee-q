@@ -1,5 +1,6 @@
--- Mesa Teacher Loop 1.2.7. Active source; run manually through Mesa MCP.
+-- Mesa Teacher Loop 1.3.0. Active source; run manually through Mesa MCP.
 -- Native walking between stages; no teleports, fabricated rewards or autoexec.
+-- Silent: no console output. Read getgenv().MesaTeacherLoop.history / :Report() instead.
 if game.PlaceId ~= 185655149 then return end
 local env = getgenv()
 if env.MesaTeacherLoop then env.MesaTeacherLoop:Stop('replaced') end
@@ -9,7 +10,7 @@ local handler = require(player.PlayerScripts.Modules.JobHandler)
 local teacher = require(player.PlayerScripts.Modules.JobHandler.HighSchoolTeacher)
 local interaction = handler.Modules.InteractionHandler
 local line = require(player.PlayerScripts.Modules._UI.MinigameHandler.LineFollow)
-local state = {version='1.2.7', alive=true, enabled=true, stage='starting',
+local state = {version='1.3.0', alive=true, enabled=true, stage='starting',
     completed=0, attempts=0, errors=0, history={}, pending=nil, mouseHeld=false, confirmedByAction={}}
 env.MesaTeacherLoop = state
 local registry
@@ -25,8 +26,7 @@ local cooldown = setmetatable({}, {__mode='k'})
 local observedTasks = setmetatable({}, {__mode='k'})
 local function log(event, data)
     table.insert(state.history, {time=os.clock(), event=event, data=data})
-    if #state.history > 100 then table.remove(state.history, 1) end
-    print('[MesaTeacher] '..event..' '..tostring(data or ''))
+    if #state.history > 400 then table.remove(state.history, 1) end
 end
 local function releaseMouse()
     state.mouseHeld=false
@@ -61,6 +61,13 @@ launchWrapper=function(self,callback,...)
     return originalLaunchShapes(self,callback,...)
 end
 line.LaunchGameShapes=launchWrapper
+function state:Report(n)
+    local out={}
+    for i=math.max(1,#self.history-(n or 40)+1),#self.history do
+        local h=self.history[i] out[#out+1]=string.format('%.1f %s %s',h.time,h.event,tostring(h.data or ''))
+    end
+    return table.concat(out,'\n')
+end
 function state:Stop(reason)
     self.alive=false self.enabled=false self.stage='stopped'
     stopWalking()
@@ -164,6 +171,24 @@ local function approach(candidate,root)
                 -- Goals stay inside the dispatch band so the walk ends where the prompt fires.
                 local maxRing=math.max(ring,math.sqrt(math.max(0,(radius-INNER_MARGIN-0.5)^2-vertical^2)))
                 if candidate.label=='activate_lecture' then maxRing=math.max(ring,LECTURE_RANGE-0.8) end
+                -- Fast path: a clear straight line to the stop point needs no path computation.
+                do
+                    local goal=Vector3.new(pos.X+direction.X*ring,root.Position.Y,pos.Z+direction.Z*ring)
+                    if (root.Position-goal).Magnitude<24 then
+                        local params=RaycastParams.new()
+                        params.FilterType=Enum.RaycastFilterType.Exclude
+                        params.FilterDescendantsInstances={player.Character}
+                        local rp=root.Position-Vector3.new(0,1.5,0)
+                        local hit=workspace:Raycast(rp,Vector3.new(goal.X-rp.X,0,goal.Z-rp.Z),params)
+                        local side=workspace:Raycast(root.Position+root.CFrame.RightVector*1.4,Vector3.new(goal.X-rp.X,0,goal.Z-rp.Z),params)
+                        local side2=workspace:Raycast(root.Position-root.CFrame.RightVector*1.4,Vector3.new(goal.X-rp.X,0,goal.Z-rp.Z),params)
+                        if not hit and not side and not side2 then
+                            nav.waypoints={{Position=goal}} nav.planning=false nav.lastProgress=os.clock()
+                            state.navigationStatus='walking_fast'
+                            return
+                        end
+                    end
+                end
                 local tries={}
                 for _,k in ipairs({0,0.6,1.2}) do
                     local rr=math.min(ring+k,maxRing)
@@ -212,14 +237,14 @@ local function approach(candidate,root)
     if nav.planning then return end
     if (root.Position-nav.lastPosition).Magnitude>0.6 then
         nav.lastPosition=root.Position nav.lastProgress=os.clock()
-    elseif os.clock()-nav.lastProgress>2.5 then
+    elseif os.clock()-nav.lastProgress>1.5 then
         log('repath',candidate.label) if cur then cur.repaths+=1 if cur.repaths%3==0 then blockedUntil[object]=os.clock()+3 end end stopWalking() return
     end
     local waypoint=nav.waypoints[nav.index]
     while waypoint do
         local last=nav.index>=#nav.waypoints
         local hd=(Vector3.new(root.Position.X,0,root.Position.Z)-Vector3.new(waypoint.Position.X,0,waypoint.Position.Z)).Magnitude
-        if hd>=(last and 1.5 or 3) then break end
+        if hd>=(last and 1.5 or 4) then break end
         if last then nav.arrived=true waypoint=nil else nav.index+=1 waypoint=nav.waypoints[nav.index] end
     end
     if nav.arrived then waypoint=nil end
@@ -453,7 +478,7 @@ task.spawn(function()
             releaseMouse() stopWalking() state.errors+=1 state.enabled=false state.stage='error_paused'
             log('error',tostring(err))
         end
-        task.wait(state.stage=='tracing_board' and 0.12 or 0.3)
+        task.wait(0.1)
     end
     releaseMouse() stopWalking()
 end)
