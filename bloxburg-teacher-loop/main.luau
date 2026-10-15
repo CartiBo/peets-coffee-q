@@ -8,7 +8,7 @@ local handler = require(player.PlayerScripts.Modules.JobHandler)
 local teacher = require(player.PlayerScripts.Modules.JobHandler.HighSchoolTeacher)
 local interaction = handler.Modules.InteractionHandler
 local line = require(player.PlayerScripts.Modules._UI.MinigameHandler.LineFollow)
-local state = {version='1.3.0', alive=true, enabled=true, stage='starting',
+local state = {version='1.6.0', alive=true, enabled=true, stage='starting',
     completed=0, attempts=0, errors=0, history={}, pending=nil, mouseHeld=false, confirmedByAction={}}
 env.MesaTeacherLoop = state
 local registry
@@ -24,6 +24,11 @@ local cooldown = setmetatable({}, {__mode='k'})
 local observedTasks = setmetatable({}, {__mode='k'})
 local function log(event, data)
     table.insert(state.history, {time=os.clock(), event=event, data=data})
+    if tostring(event):find('mood') then
+        state.moodHistory=state.moodHistory or {}
+        table.insert(state.moodHistory, {time=os.clock(), event=event, data=data})
+        if #state.moodHistory > 200 then table.remove(state.moodHistory, 1) end
+    end
     if #state.history > 400 then table.remove(state.history, 1) end
 end
 local function releaseMouse()
@@ -31,7 +36,7 @@ local function releaseMouse()
 end
 local pathfinding=game:GetService('PathfindingService')
 local navigation
-local WALK_SPEED=24
+local WALK_SPEED=28
 local LECTURE_RANGE=7
 local cur,lectureLogged,boardLogged
 local function track(object,label)
@@ -66,23 +71,121 @@ function state:Report(n)
     end
     return table.concat(out,'\n')
 end
+local function detachMoodNative()
+    local identity=getthreadidentity and getthreadidentity()
+    local char=player.Character
+    local root=char and char:FindFirstChild('HumanoidRootPart')
+    local hum=char and char:FindFirstChildOfClass('Humanoid')
+    local attached=false
+    pcall(function() attached=handler.Shared.AttachService:GetAttachWeld(char)~=nil end)
+    if attached or (root and root:FindFirstChild('AttachWeld')) or (hum and hum.Sit) then
+        -- Native stand-up: destroys the local weld and tells the server (Type='Detach'), so the sit pose really ends.
+        state.detachedAt=os.clock()
+        task.spawn(function()
+            pcall(function() handler.Modules.CharacterHandler:Detach() end)
+            if hum and hum.Parent then hum.Sit=false end
+        end)
+    end
+    pcall(function() handler.Shared.AttachService:DetachPlayer(player) end)
+    if identity and setthreadidentity then setthreadidentity(identity) end
+end
 function state:Stop(reason)
     self.alive=false self.enabled=false self.stage='stopped'
+    if self.mood then
+        self.mood.token+=1 self.mood.busy=false self.mood.phase='idle'
+        detachMoodNative()
+    end
     stopWalking()
     releaseMouse()
-    if self.connection then self.connection:Disconnect() end
+    if self.gui then self.gui:Destroy() self.gui=nil end
     if line.LaunchGameShapes==launchWrapper then line.LaunchGameShapes=originalLaunchShapes end
     log('stopped',reason)
 end
-state.connection=input.InputBegan:Connect(function(key, _processed)
-    -- F9 is also processed by Roblox's core UI; emergency stop must still run.
-    if input:GetFocusedTextBox() then return end
-    if key.KeyCode == Enum.KeyCode.F8 then
+-- Stage hub (replaces the F7/F8/F9 keybinds): one Docente button toggling all stages jointly, plus mood and pause/stop.
+state.stageOn={pass=true,scold=true,board=true}
+local STAGE_OF={I_Take='pass',I_Give='pass',I_Scold='scold',activate_lecture='board',B_Interact='board'}
+do
+    local parent=(gethui and gethui()) or game:GetService('CoreGui')
+    local gui=Instance.new('ScreenGui')
+    gui.Name='MesaTeacherHub' gui.ResetOnSpawn=false gui.DisplayOrder=50
+    local frame=Instance.new('Frame')
+    frame.Size=UDim2.fromOffset(176,0) frame.AutomaticSize=Enum.AutomaticSize.Y
+    frame.AnchorPoint=Vector2.new(0,0.5)
+    frame.Position=UDim2.new(0,16,0.5,0)
+    frame.BackgroundColor3=Color3.fromRGB(14,18,22) frame.BackgroundTransparency=0.12
+    frame.BorderSizePixel=0 frame.Parent=gui
+    Instance.new('UICorner',frame).CornerRadius=UDim.new(0,10)
+    local stroke=Instance.new('UIStroke',frame) stroke.Color=Color3.fromRGB(45,212,191) stroke.Transparency=0.55
+    local pad=Instance.new('UIPadding',frame)
+    pad.PaddingTop=UDim.new(0,8) pad.PaddingBottom=UDim.new(0,8) pad.PaddingLeft=UDim.new(0,8) pad.PaddingRight=UDim.new(0,8)
+    local list=Instance.new('UIListLayout',frame) list.Padding=UDim.new(0,4) list.SortOrder=Enum.SortOrder.LayoutOrder
+    local function label(text,order,size,color)
+        local l=Instance.new('TextLabel')
+        l.Size=UDim2.new(1,0,0,size) l.BackgroundTransparency=1 l.Text=text l.LayoutOrder=order
+        l.Font=Enum.Font.GothamBold l.TextSize=size>16 and 14 or 11 l.TextColor3=color
+        l.TextXAlignment=Enum.TextXAlignment.Left l.Parent=frame
+        return l
+    end
+    label('DOCENTE',0,18,Color3.fromRGB(45,212,191))
+    local status=label('',1,22,Color3.fromRGB(150,160,170))
+    status.Font=Enum.Font.Gotham status.TextSize=10 status.TextWrapped=true
+    local function button(order,name,get,click)
+        local b=Instance.new('TextButton')
+        b.Size=UDim2.new(1,0,0,26) b.LayoutOrder=order b.AutoButtonColor=false b.BorderSizePixel=0
+        b.Font=Enum.Font.GothamMedium b.TextSize=12 b.Parent=frame
+        Instance.new('UICorner',b).CornerRadius=UDim.new(0,6)
+        local function paint()
+            local on,text=get()
+            b.Text=text or ((on and '● ' or '○ ')..name)
+            b.BackgroundColor3=on and Color3.fromRGB(20,110,100) or Color3.fromRGB(34,40,46)
+            b.TextColor3=on and Color3.fromRGB(230,255,250) or Color3.fromRGB(140,150,160)
+        end
+        b.MouseButton1Click:Connect(function() click() paint() end)
+        b.MouseEnter:Connect(function() b.BackgroundTransparency=0.15 end)
+        b.MouseLeave:Connect(function() b.BackgroundTransparency=0 end)
+        paint()
+        return paint
+    end
+    local paints={}
+    local function teacherOn() local s=state.stageOn return s.pass and s.scold and s.board end
+    paints[#paints+1]=button(2,'Docente',teacherOn,function()
+        local on=not teacherOn()
+        state.stageOn.pass=on state.stageOn.scold=on state.stageOn.board=on
+        if not on then releaseMouse() stopWalking() end
+        log('stage_teacher',on)
+    end)
+    label('ÁNIMO',5,14,Color3.fromRGB(45,212,191))
+    paints[#paints+1]=button(6,'Auto-ánimo',function() return state.mood and state.mood.enabled end,function()
+        if not state.mood then return end
+        state.mood.enabled=not state.mood.enabled
+        -- Off means off: abort any trip in flight; no further warps or shift starts.
+        if not state.mood.enabled and state.moodCancel then state.moodCancel('hub') end
+        log('mood_enabled',state.mood.enabled)
+    end)
+    label('CONTROL',7,12,Color3.fromRGB(150,160,170))
+    paints[#paints+1]=button(8,'Pausa',function() return not state.enabled,(state.enabled and '⏸ Pausar' or '▶ Reanudar') end,function()
         state.enabled=not state.enabled
         if not state.enabled then releaseMouse() stopWalking() end
         log('enabled',state.enabled)
-    elseif key.KeyCode == Enum.KeyCode.F9 then state:Stop('F9') end
-end)
+    end)
+    local stop=Instance.new('TextButton')
+    stop.Size=UDim2.new(1,0,0,26) stop.LayoutOrder=9 stop.AutoButtonColor=false stop.BorderSizePixel=0
+    stop.Font=Enum.Font.GothamMedium stop.TextSize=12 stop.Text='■ Detener'
+    stop.BackgroundColor3=Color3.fromRGB(120,36,44) stop.TextColor3=Color3.fromRGB(255,225,225) stop.Parent=frame
+    Instance.new('UICorner',stop).CornerRadius=UDim.new(0,6)
+    stop.MouseButton1Click:Connect(function() state:Stop('hub') end)
+    gui.Parent=parent
+    state.gui=gui
+    task.spawn(function()
+        while state.alive and gui.Parent do
+            local st=tostring(state.stage):gsub('_',' ')
+            if not state.enabled then st='EN PAUSA - pulsa Reanudar' end
+            status.Text=st..' · '..state.completed..' hechas'
+            for _,p in ipairs(paints) do p() end
+            task.wait(0.5)
+        end
+    end)
+end
 local function origin(object)
     local part=interaction.Shared.InteractionData:GetOrigin(object,6)
     if typeof(part)=='Instance' then
@@ -115,15 +218,37 @@ local function stopRange(object)
     local radius=object:GetAttribute('OverrideInteractRadius') or interaction.Shared.InteractionData.INTERACTION_DISTANCE
     return math.min(STOP_RANGE,radius-INNER_MARGIN-1)
 end
-local function action(object,wanted)
+local function findAction(object,wanted)
     local entry=registry[object]
-    if not entry or type(entry[1])~='table' then return end
-    for _, provider in pairs(entry[1]) do
-        if type(provider)=='function' then
-            local ok,label,_,callback=pcall(provider)
-            if ok and label==wanted and type(callback)=='function' then return callback end
+    if entry and type(entry[1])=='table' then
+        for _, provider in pairs(entry[1]) do
+            if type(provider)=='function' then
+                local ok,label,_,callback=pcall(provider)
+                if ok and label==wanted and type(callback)=='function' then
+                    return {callback=callback,isCustom=true,label=label,object=object}
+                end
+            end
         end
     end
+    local id=interaction.Shared and interaction.Shared.InteractionData
+    if id and typeof(object)=='Instance' then
+        local ok,data=pcall(function() return id:GetData(object,player) end)
+        if ok and type(data)=='table' then
+            for i, fn in ipairs(data) do
+                if type(fn)=='function' then
+                    local sok,label,_,callback,opts=pcall(fn,object)
+                    if sok and label==wanted and type(callback)=='function' then
+                        return {callback=callback,isCustom=false,label=label,path=tostring(i),options=opts or {},object=object}
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+local function action(object,wanted)
+    local act=findAction(object,wanted)
+    return act and act.callback or nil
 end
 local function equippedPass()
     local item=handler.Shared.EquipmentService:GetEquipped(player)
@@ -151,6 +276,7 @@ local function approach(candidate,root)
         local nav={object=object,label=candidate.label,humanoid=humanoid,planning=true,
             origSpeed=humanoid.WalkSpeed,started=os.clock(),lastProgress=os.clock(),lastPosition=root.Position,index=1}
         navigation=nav
+        if humanoid.WalkSpeed<WALK_SPEED then humanoid.WalkSpeed=WALK_SPEED end
         state.navigationStatus='planning'
         log('approach',candidate.label..' desk='..tostring(state.targetDesk))
         task.spawn(function()
@@ -211,7 +337,7 @@ local function approach(candidate,root)
                     -- Last resort: walk straight to the closest interior point; the stuck
                     -- detector repaths if something is in the way.
                     local flat=Vector3.new(pos.X+direction.X*ring,root.Position.Y,pos.Z+direction.Z*ring)
-                    if (root.Position-pos).Magnitude<30 then
+                    if (root.Position-pos).Magnitude<50 then
                         nav.waypoints={{Position=flat}} nav.planning=false nav.lastProgress=os.clock()
                         state.navigationStatus='walking_direct'
                         log('path_direct',candidate.label)
@@ -300,11 +426,643 @@ local function traceBoard()
         callback()
     end
 end
+-- Auto-mood: each 6,000 of native shift earnings ends the shift after the pending action, warps home with the
+-- native HouseHandler:ToPlot (same call as the phone's "Go to plot" button), refills needs with
+-- native house interactions, then warps back through the native job warp and restarts the shift.
+local jobKey=tostring(teacher.Script)
+local NEEDS={
+    {name='Hunger',labels={'I_TakeQuickMeal','I_Eat'}},
+    {name='Energy',labels={'I_Sleep'}},
+    {name='Hygiene',labels={'I_Use','I_UseShower','I_UseBathtub','I_WashFace','I_BrushTeeth'}},
+    {name='Fun',labels={'I_Watch','I_TurnOn','I_PlayAlone'}},
+}
+-- Quick meals in preference order (cheap and filling-sounding; real gain is measured and logged).
+local FOOD_PRIORITY={'Apple','Banana','Yogurt','Cereal','Toast','Grilled Cheese','PB&J','Oatmeal',"Mac 'n' Cheese"}
+-- Normal decay (98, 95, 92...) never triggers anything. A trip starts at each 6,000 of shift earnings only if some need is
+-- below minReturn (70), or at any time a need is critical (<startBelow, 25). At home needs below minReturn are served up to
+-- fillTarget (98); the player goes back as soon as every need is >=minReturn.
+local mood={enabled=true,phase='idle',values={},earningsTarget=6000,nextEarnings=6000,target=90,startBelow=25,minReturn=70,fillTarget=98,homeMax=900,actionMax=240,cooldown=180,
+    cooldownUntil=0,trips=0,busy=false,token=0,foodGain={},failed=setmetatable({},{__mode='k'})}
+state.mood=mood
+task.spawn(function()
+    local last=os.clock()
+    while state.alive do
+        task.wait(0.1)
+        local now=os.clock()
+        if state.enabled and not input:GetFocusedTextBox() then mood.clock=(mood.clock or 0)+(now-last) end
+        last=now
+    end
+end)
+-- Cancellation: bumping the token makes every in-flight trip thread stop at its next gate.
+local function moodCancel(reason)
+    mood.token+=1 mood.phase='idle' mood.busy=false mood.action=nil
+    detachMoodNative()
+    log('mood_cancel',reason)
+end
+state.moodCancel=moodCancel
+-- True while the trip owned by tok may continue; holds (F8 pause) until resumed, or holds during typing.
+local function gate(tok)
+    while state.alive and mood.enabled and mood.token==tok and not state.enabled do task.wait(0.2) end
+    while state.alive and mood.enabled and mood.token==tok and input:GetFocusedTextBox() do task.wait(0.2) end
+    return state.alive and mood.enabled and mood.token==tok and state.enabled
+end
+local function pause(tok,seconds)
+    task.wait(seconds)
+    return gate(tok)
+end
+local function readMood()
+    local ok,folder=pcall(function() return game:GetService('ReplicatedStorage').Stats[player.Name].MoodData end)
+    if not ok or not folder then return false end
+    local values,lowName,lowValue={},nil,math.huge
+    for _,need in ipairs(NEEDS) do
+        local object=folder:FindFirstChild(need.name)
+        if object then
+            values[need.name]=object.Value
+            if object.Value<lowValue then lowValue=object.Value lowName=need.name end
+        end
+    end
+    local total=0 for _,need in ipairs(NEEDS) do total+=values[need.name] or 0 end
+    mood.overall=total/#NEEDS
+    mood.values=values mood.lowest=lowName mood.lowestValue=lowValue mood.status=folder.Value
+    return lowName~=nil
+end
+-- Reads replicated job data only; never parses currency text or touches the player's balance.
+function state:MoodEarnings()
+    local ok,amount=pcall(function()
+        local job=handler.Modules.ClientStats:GetStat('Job')
+        local value=job and job:FindFirstChild('ShiftEarnings')
+        return value and tonumber(value.Value)
+    end)
+    if not ok or not amount or amount<0 or amount~=amount then
+        mood.earningsAvailable=false
+        return nil
+    end
+    if mood.shiftEarnings and amount<mood.shiftEarnings then
+        mood.nextEarnings=mood.earningsTarget
+    end
+    mood.shiftEarnings=amount mood.earningsAvailable=true
+    return amount
+end
+-- The fridge refuses quick meals once Hunger is high (observed ~75). A need the game will not fill further
+-- counts as satisfied while it stays >=60, so the visit can end instead of waiting for an unreachable 98.
+local CAPPED_MIN=75
+local function needCapped(name)
+    return mood.capped and mood.capped[name] and (mood.values[name] or 0)>=CAPPED_MIN
+end
+local function moodReadyForWork()
+    if not mood.overall then return false end
+    for _,need in ipairs(NEEDS) do
+        local v=mood.values[need.name] or 0
+        if v<mood.minReturn and not needCapped(need.name) then return false end
+    end
+    return true
+end
+local function isAtHome(root)
+    local plot=workspace.Plots:FindFirstChild('Plot_'..player.Name)
+    if not plot or not root then return false end
+    local house=plot:FindFirstChild('House')
+    if house then
+        local hp=house:GetPivot().Position
+        if (root.Position-hp).Magnitude<200 then return true end
+    end
+    local ground=plot:FindFirstChild('Ground')
+    if ground and ground:IsA('BasePart') then
+        if (root.Position-ground.Position).Magnitude<200 then return true end
+    end
+    return false
+end
+local function findMoodTarget(need,root)
+    local plot=workspace.Plots:FindFirstChild('Plot_'..player.Name)
+    if not plot then return nil end
+    local candidates={}
+    for _, d in ipairs(plot:GetDescendants()) do
+        if d:IsA('BasePart') and (mood.failed[d] or 0)<os.clock() and (blockedUntil[d] or 0)<os.clock() then
+            local n=d.Name:lower()
+            local matched=false
+            local prio=10
+            if need.name=='Hunger' then
+                if n:find('fridge') and not n:find('cabinet') then matched=true prio=1 end
+            elseif need.name=='Energy' then
+                if n:find('bed') and not n:find('lamp') and not n:find('table') and not n:find('sheet') then matched=true prio=1 end
+            elseif need.name=='Hygiene' then
+                -- Toilet only adds a slow status (about 2 per use), so showers/baths go first when they have room.
+                if n:find('shower') or n:find('bathtub') then matched=true prio=1
+                elseif n:find('toilet') then matched=true prio=2
+                elseif n:find('sink') or n:find('vanity') then matched=true prio=3 end
+            elseif need.name=='Fun' then
+                if n:find('tv') or n:find('television') then matched=true prio=1 end
+            end
+            if matched then
+                local dDist=distance(d,root)
+                -- Search the whole current plot, including large/rebuilt houses.
+                if dDist<math.huge then
+                    table.insert(candidates,{object=d,prio=prio,dist=dDist})
+                end
+            end
+        end
+    end
+    table.sort(candidates,function(a,b)
+        if a.prio~=b.prio then return a.prio<b.prio end
+        return a.dist<b.dist
+    end)
+    for _, c in ipairs(candidates) do
+        local obj=c.object
+        for _, label in ipairs(need.labels) do
+            local act=findAction(obj,label)
+            if act then
+                return {object=obj,label=label,path=act.path,options=act.options,callback=act.callback,isCustom=act.isCustom,taskID=0,d=c.dist}
+            end
+        end
+    end
+    return nil
+end
+-- Mood navigation is deliberately independent of the teacher pathfinding.
+local function moodDetach()
+    detachMoodNative()
+    local hum=player.Character and player.Character:FindFirstChildOfClass('Humanoid')
+    if hum then hum.Sit=false end
+end
+local function moodDispatch(c)
+    local fresh=findAction(c.object,c.label)
+    if not fresh then error('Interaction unavailable: '..c.label) end
+    local _,extra=fresh.callback()
+    if not fresh.isCustom then
+        local opts=fresh.options or {}
+        if not opts.NoSend then
+            local packet={Type='Interact',Target=c.object,Path=fresh.path or '1'}
+            for k,v in pairs(opts.SendData or {}) do packet[k]=v end
+            if type(extra)=='table' then for k,v in pairs(extra) do packet[k]=v end end
+            if not packet.NoSend then handler.net:FireServer(packet) end
+        end
+    end
+end
+local function moodWaypoint(c,root)
+    stopWalking()
+    local pos=origin(c.object)
+    if not pos then return false end
+    local char=player.Character
+    local ray=RaycastParams.new()
+    ray.FilterType=Enum.RaycastFilterType.Exclude
+    ray.FilterDescendantsInstances={char,c.object}
+    local overlap=OverlapParams.new()
+    overlap.FilterType=Enum.RaycastFilterType.Exclude
+    overlap.FilterDescendantsInstances={char,c.object}
+    local radius=c.object:GetAttribute('OverrideInteractRadius') or interaction.Shared.InteractionData.INTERACTION_DISTANCE
+    local nativeAttach=c.object:FindFirstChild('AttachPos',true)
+    local preferred
+    if nativeAttach and nativeAttach:IsA('Attachment') then preferred=nativeAttach.WorldPosition
+    elseif nativeAttach and nativeAttach:IsA('BasePart') then preferred=nativeAttach.Position end
+    local best,bestD
+    for _,r in ipairs({math.min(4,radius-3),math.min(6,radius-3),2.5}) do
+        if r>0 then for i=0,15 do
+            local a=i*math.pi/8
+            local point=pos+Vector3.new(math.cos(a)*r,3,math.sin(a)*r)
+            local hit=workspace:Raycast(point,Vector3.new(0,-9,0),ray)
+            if hit and hit.Normal.Y>0.7 and math.abs(hit.Position.Y-pos.Y)<2 then
+                local dest=hit.Position+Vector3.new(0,root.Size.Y/2+2,0)
+                local clear=true
+                for _,part in ipairs(workspace:GetPartBoundsInBox(CFrame.new(dest),Vector3.new(2,4,2),overlap)) do
+                    if part.CanCollide then clear=false break end
+                end
+                local d=preferred and (dest-preferred).Magnitude*10 or (dest-root.Position).Magnitude
+                if clear and (dest-pos).Magnitude<radius-1 and (not bestD or d<bestD) then best=dest bestD=d end
+            end
+        end end
+    end
+    if not best then log('mood_waypoint_blocked',c.object.Name) return false end
+    moodDetach()
+    char:PivotTo(CFrame.lookAt(best,Vector3.new(pos.X,best.Y,pos.Z)))
+    root.AssemblyLinearVelocity=Vector3.zero
+    root.AssemblyAngularVelocity=Vector3.zero
+    log('mood_waypoint',c.object.Name..' distance='..math.round((best-pos).Magnitude*10)/10)
+    return true
+end
+local function moodSeat(tv,root,tok)
+    local plot=workspace.Plots:FindFirstChild('Plot_'..player.Name)
+    local seat,seatDistance
+    for _,o in ipairs(plot:GetDescendants()) do
+        if o:IsA('BasePart') then
+            local n=o.Name:lower()
+            if n:find('sofa') or n:find('couch') or n:find('armchair') then
+                local d=(o.Position-tv.object.Position).Magnitude
+                if d<20 and (not seatDistance or d<seatDistance) then
+                    local a=findAction(o,'I_Sit')
+                    if a then seat={object=o,label='I_Sit'} seatDistance=d end
+                end
+            end
+        end
+    end
+    if seat and gate(tok) then
+        -- Seat first, then watch: television uses a proximity attachment with Multiple=true.
+        if moodWaypoint(seat,root) then
+            if not pause(tok,0.9) then return end
+            moodDispatch(seat)
+            if not pause(tok,0.5) then return end
+            if inRange(tv.object,root) then moodDispatch(tv) end
+        end
+    end
+end
+local function dismissPopups()
+    pcall(function()
+        local gui=player.PlayerGui
+        local msgBox=gui:FindFirstChild('_MessageBox')
+        if msgBox then
+            msgBox.Enabled=false
+            for _, b in ipairs(msgBox:GetDescendants()) do
+                if b:IsA('GuiButton') and b.Name=='ButtonTemplate' then
+                    for _, c in ipairs(getconnections(b.Activated)) do c:Fire() end
+                    for _, c in ipairs(getconnections(b.MouseButton1Click)) do c:Fire() end
+                end
+            end
+        end
+        local mg=gui:FindFirstChild('MainGUI')
+        if mg then
+            for _, f in ipairs(mg:GetChildren()) do
+                if (f.Name=='PaycheckFrame' or f.Name=='PaycheckFrameOriginal') and f:IsA('GuiObject') then
+                    f.Position=UDim2.new(10,0,10,0) f.Visible=false
+                end
+            end
+        end
+    end)
+end
+local function pickQuickFood(list)
+    for _,wanted in ipairs(FOOD_PRIORITY) do
+        for _,entry in ipairs(list) do
+            if entry._itemName==wanted and entry.Price and entry.Price>0 then return entry end
+        end
+    end
+    local cheapest
+    for _,entry in ipairs(list) do
+        if entry.Price and entry.Price>0 and (not cheapest or entry.Price<cheapest.Price) then cheapest=entry end
+    end
+    return cheapest
+end
+-- Fridge sequence (native): I_TakeQuickMeal -> list "T_QuickMeals" -> server TakeQuickFood -> EatEquipped.
+local function takeAndEat(c,tok,act)
+    dismissPopups()
+    log('mood_meal_start','sit='..tostring(player.Character and player.Character:FindFirstChildOfClass('Humanoid').Sit))
+    detachMoodNative()
+    local lfh=handler.Modules.ListFrameHandler
+    local original=lfh.ShowList
+    lfh.ShowList=function(self,info,list,...)
+        if type(info)=='table' and info.Title=='T_QuickMeals' and type(list)=='table' then
+            local pick=pickQuickFood(list)
+            if pick then act.food=pick._itemName return pick end
+        end
+        return original(self,info,list,...)
+    end
+    local ok,err=pcall(function()
+        local equipment=handler.Shared.EquipmentService
+        local function held()
+            local item=equipment:GetEquipped(player)
+            return typeof(item)=='Instance' and item or nil
+        end
+        local before=held()
+        if not pause(tok,0.5) then return end
+
+        local opts=c.options or {}
+        if not opts.NoSend then
+            local packet={Type='Interact',Target=c.object,Path=c.path or '1'}
+            if opts.SendData then
+                for k,v in pairs(opts.SendData) do packet[k]=v end
+            end
+            handler.net:FireServer(packet)
+        end
+
+        task.spawn(function()
+            pcall(c.callback)
+        end)
+
+        task.spawn(function()
+            task.wait(0.6)
+            if not act.food then
+                local fallbackFood=FOOD_PRIORITY[1]
+                act.food=fallbackFood
+                handler.net:FireServer({Type='TakeQuickFood',Name=fallbackFood})
+            end
+        end)
+
+        local t=os.clock()
+        -- No resend of TakeQuickFood: each accepted request is a purchase. The native callback attaches the player to the
+        -- fridge first and aborts if already attached (e.g. still seated), hence the detach at the start.
+        while (not held() or held()==before) and os.clock()-t<12 do
+            if not pause(tok,0.25) then return end
+        end
+        local item=held()
+        if not item or item==before then
+            log('mood_meal_fail','food='..tostring(act.food)..' sit='..tostring(player.Character:FindFirstChildOfClass('Humanoid').Sit))
+            error('no_meal_equipped')
+        end
+        if not gate(tok) then return end
+
+        local h0=mood.values.Hunger or 0
+        local eatStart=os.clock()
+        while held() and os.clock()-eatStart<15 do
+            handler.net:FireServer({Type='EatEquipped',IsQuick=true})
+            pcall(function()
+                local eb=player.PlayerGui.HUDGui.Hotbar.LayoutContainer:FindFirstChild('EquippedButton',true)
+                if eb then for _,conn in ipairs(getconnections(eb.Activated) or {}) do conn:Fire() end end
+            end)
+            if not pause(tok,1) then return end
+            readMood()
+            if (mood.values.Hunger or 0)>=mood.target then break end
+        end
+        readMood()
+        act.gained=(mood.values.Hunger or 0)-h0
+    end)
+    lfh.ShowList=original
+    if not ok then error(err,0) end
+end
+local function anyTeacherStageEnabled()
+    return state.stageOn.pass or state.stageOn.scold or state.stageOn.board
+end
+local function moodFinish(reason,ok)
+    mood.cooldownUntil=os.clock()+mood.cooldown
+    mood.phase='idle' mood.busy=false mood.action=nil
+    if ok==false then mood.enabled=false end
+    log('mood_done',reason..' enabled='..tostring(mood.enabled))
+end
+local function moodStep()
+    local now=mood.clock or 0
+    local phase=mood.phase
+    local earnings=state:MoodEarnings()
+    if phase=='idle' then
+        if not mood.enabled or os.clock()<mood.cooldownUntil or state.pending then return false end
+        if not readMood() then return false end
+        local root=player.Character and player.Character:FindFirstChild('HumanoidRootPart')
+        if not root then return false end
+        local atHome=isAtHome(root)
+        if line:IsRunning() then return false end
+        if atHome then
+            -- A manual home fill runs once. Natural decay cannot start another home loop.
+            if mood.homePrepared then return false end
+            if (mood.lowestValue or 100)>=mood.startBelow then return false end
+            mood.returnSatisfied=false
+            mood.capped={}
+            mood.phase='home' mood.startLowest=mood.lowestValue mood.trips+=1 mood.busy=false
+            mood.homeStart=now
+            stopWalking()
+            log('mood_home_start',mood.lowest..'='..math.round(mood.lowestValue)..' status='..tostring(mood.status))
+            return true
+        else
+            if not handler:IsWorking(teacher.Script) or not anyTeacherStageEnabled() then return false end
+            local critical=(mood.lowestValue or 100)<mood.startBelow
+            local milestone=earnings and earnings>=mood.nextEarnings
+            if not critical and not milestone then return false end
+            if milestone then
+                -- Consume the milestone before leaving; a delayed/resetting payout cannot retrigger it.
+                mood.nextEarnings=(math.floor(earnings/mood.earningsTarget)+1)*mood.earningsTarget
+                if not critical and moodReadyForWork() then log('mood_skip','milestone, needs ok min='..math.round(mood.lowestValue)) return false end
+            end
+            mood.triggerEarnings=earnings
+            mood.homePrepared=false
+            mood.returnSatisfied=false
+            mood.capped={}
+            mood.phase='leaving' mood.startLowest=mood.lowestValue mood.trips+=1 mood.busy=false
+            stopWalking()
+            log('mood_leave','earnings='..tostring(earnings)..' next='..tostring(mood.nextEarnings)..' min='..math.round(mood.lowestValue))
+            return true
+        end
+    elseif phase=='leaving' then
+        state.stage='mood_leaving'
+        if mood.busy then return true end
+        mood.busy=true
+        local tok=mood.token
+        task.spawn(function()
+            local ok,err=pcall(function()
+                if not gate(tok) then return end
+                dismissPopups()
+                local root=player.Character and player.Character:FindFirstChild('HumanoidRootPart')
+                local from=root and root.Position
+                if handler:IsWorking(teacher.Script) then handler:StopWorking() end
+                local t=os.clock()
+                while handler:IsWorking(teacher.Script) and os.clock()-t<5 do
+                    if not pause(tok,0.2) then return end
+                end
+                if not pause(tok,0.5) then return end
+                handler.Modules.HouseHandler:ToPlot()
+                if not pause(tok,1) then return end
+                root=player.Character and player.Character:FindFirstChild('HumanoidRootPart')
+                mood.moved=root and from and (root.Position-from).Magnitude or 0
+            end)
+            if not state.alive or mood.token~=tok then return end
+            if not ok then log('mood_error',tostring(err)) mood.moved=0 end
+            mood.phase=(mood.moved or 0)>20 and 'home' or 'return'
+            mood.homeStart=mood.clock or 0 mood.busy=false
+            log('mood_home','moved='..math.round(mood.moved or 0))
+        end)
+        return true
+    elseif phase=='home' then
+        dismissPopups()
+        local root=player.Character and player.Character:FindFirstChild('HumanoidRootPart')
+        local humanoid=player.Character and player.Character:FindFirstChildOfClass('Humanoid')
+        if not root or not humanoid or humanoid.Health<=0 then return true end
+        if not readMood() then
+            moodDetach() moodFinish('mood_stats_unavailable',false)
+            return true
+        end
+        -- Accept healthy decay during the visit instead of cycling through already filled needs.
+        if moodReadyForWork() and not mood.busy and (not mood.action or mood.action.returned) then
+            mood.returnSatisfied=true mood.homePrepared=true
+            mood.lastFull={time=now,values=table.clone(mood.values),overall=mood.overall}
+            mood.action=nil mood.retryAt=nil mood.waitingFor=nil
+            moodDetach()
+            log('mood_ready',string.format('overall=%.2f min=%.2f',mood.overall,mood.lowestValue))
+            if anyTeacherStageEnabled() then mood.phase='return' else moodFinish('healthy_needs',true) end
+            return true
+        end
+        local act=mood.action
+        if act then
+            local plot=workspace.Plots:FindFirstChild('Plot_'..player.Name)
+            if not plot or not act.object:IsDescendantOf(plot) then
+                moodDetach()
+                mood.action=nil
+                mood.retryAt=nil
+                log('mood_target_removed',act.label)
+                return true
+            end
+            local value=mood.values[act.need.name] or 0
+            local gained=value-act.startValue
+            state.stage='mood_'..act.need.name:lower()..'_'..math.round(value)
+            if act.label=='I_TurnOn' and act.returned then
+                -- Give the server time to flag the TV as on; re-dispatching would toggle it off again.
+                mood.action=nil mood.retryAt=now+2
+                return true
+            end
+            if act.label=='I_TakeQuickMeal' then
+                if act.returned then
+                    log('mood_meal_done','gained='..(math.round(gained*10)/10)..' now='..math.round(value)..(act.food and (' food='..act.food) or ''))
+                    mood.action=nil
+                elseif now-act.started>20 then
+                    log('mood_meal_timeout',act.label)
+                    mood.failed[act.object]=os.clock()+30
+                    mood.action=nil
+                end
+                return true
+            end
+            if value>=mood.fillTarget then
+                log('mood_need_ok',act.need.name..'='..math.round(value))
+                mood.action=nil
+                moodDetach()
+            elseif now-act.started>mood.actionMax or (act.returned and gained<1 and now-act.started>20) then
+                log('mood_action_failed',act.label..' gained='..(math.round(gained*10)/10))
+                mood.failed[act.object]=os.clock()+60
+                mood.action=nil
+                moodDetach()
+            end
+            return true
+        end
+        if now-mood.homeStart>mood.homeMax then
+            moodDetach() moodFinish('home_timeout_below_healthy',false)
+            log('mood_home_timeout')
+            return true
+        end
+        if mood.retryAt and now<mood.retryAt then return true end
+        mood.retryAt=nil
+        local pick
+        local missing={}
+        for _,need in ipairs(NEEDS) do
+            local value=mood.values[need.name] or 0
+            if value<mood.minReturn and not needCapped(need.name) then
+                local target=findMoodTarget(need,root)
+                if target then
+                    if not pick or value<pick.value then pick={need=need,target=target,value=value} end
+                else
+                    table.insert(missing,need.name)
+                end
+            end
+        end
+        if not pick then
+            if mood.waitingFor~=table.concat(missing,',') then log('mood_wait_targets',table.concat(missing,',')) end
+            mood.waitingFor=table.concat(missing,',')
+            mood.retryAt=now+1
+            state.stage='mood_wait_'..mood.waitingFor
+            return true
+        end
+        mood.waitingFor=nil
+        state.stage='mood_to_'..pick.need.name:lower()
+        local c=pick.target
+        if inInner(c.object,root) then
+            stopWalking()
+            local act={need=pick.need,label=c.label,object=c.object,started=now,startValue=pick.value}
+            mood.action=act
+            log('mood_use',c.label..' '..pick.need.name..'='..math.round(pick.value)..' '..c.object.Name)
+            local tok=mood.token
+            task.spawn(function()
+                local ok,err=pcall(function()
+                    if c.label=='I_TakeQuickMeal' then
+                        takeAndEat(c,tok,act)
+                    else
+                        if not gate(tok) then return end
+                        -- Native Attach (toilet, bed, sofa) aborts while the previous seat is still attached server-side.
+                        detachMoodNative()
+                        local wait=(state.detachedAt or 0)+0.8-os.clock()
+                        if wait>0 and not pause(tok,wait) then return end
+                        moodDispatch(c)
+                        if c.label=='I_Watch' then moodSeat(c,root,tok) end
+                    end
+                end)
+                if mood.token~=tok then return end
+                if not ok then
+                    state.errors+=1
+                    log('mood_callback_error',tostring(err))
+                    if c.label=='I_TakeQuickMeal' and tostring(err):find('no_meal_equipped') and (mood.values.Hunger or 0)>=CAPPED_MIN then
+                        mood.capped=mood.capped or {}
+                        mood.capped.Hunger=true
+                        log('mood_capped','Hunger='..math.round(mood.values.Hunger or 0))
+                    end
+                    mood.failed[c.object]=os.clock()+(c.label=='I_TakeQuickMeal' and 12 or 60)
+                    mood.action=nil
+                elseif mood.action==act then
+                    act.returned=true
+                end
+            end)
+        else
+            if not moodWaypoint(c,root) then mood.failed[c.object]=os.clock()+30 end
+        end
+        return true
+    elseif phase=='return' then
+        state.stage='mood_returning'
+        if mood.busy then return true end
+        mood.busy=true
+        local tok=mood.token
+        task.spawn(function()
+            local ok,err=pcall(function()
+                if not gate(tok) then return end
+                stopWalking()
+                dismissPopups()
+                local humanoid=player.Character and player.Character:FindFirstChildOfClass('Humanoid')
+                moodDetach()
+                if not pause(tok,0.5) then return end
+                local t=os.clock()
+                while not handler:IsWorking(teacher.Script) and os.clock()-t<30 do
+                    if not gate(tok) then return end
+                    dismissPopups()
+                    if handler:HasOngoingJob() and not handler:IsWorking(teacher.Script) then
+                        handler:StopWorking()
+                        if not pause(tok,1) then return end
+                    elseif not handler:GoToWork(jobKey) then
+                        if not pause(tok,2) then return end
+                    else
+                        local w=os.clock()
+                        while not handler:IsWorking(teacher.Script) and os.clock()-w<4 do
+                            if not pause(tok,0.3) then return end
+                        end
+                        if not gate(tok) then return end
+                        if not handler:IsWorking(teacher.Script) then
+                            handler:StartWorking(jobKey)
+                            if not pause(tok,2) then return end
+                        end
+                    end
+                end
+            end)
+            if not state.alive or mood.token~=tok then return end
+            readMood()
+            local back=handler:IsWorking(teacher.Script)
+            if not ok then log('mood_error',tostring(err)) end
+            local gained=(mood.lowestValue or 0)-(mood.startLowest or 0)
+            moodFinish('back='..tostring(back)..' gained='..math.round(gained),back and (mood.returnSatisfied==true))
+        end)
+        return true
+    end
+    return false
+end
+function state:MoodStatus()
+    readMood()
+    local out={}
+    for _,need in ipairs(NEEDS) do out[#out+1]=need.name..'='..math.round(mood.values[need.name] or -1) end
+    local earnings=self:MoodEarnings()
+    return string.format('%s phase=%s enabled=%s trips=%d earnings=%s next=%s ready=%s %s',tostring(mood.status),mood.phase,tostring(mood.enabled),mood.trips,tostring(earnings),tostring(mood.nextEarnings),tostring(moodReadyForWork()),table.concat(out,' '))
+end
+-- Read-only discovery for checking a rebuilt house without starting a trip.
+function state:MoodTargets()
+    local root=player.Character and player.Character:FindFirstChild('HumanoidRootPart')
+    local out={}
+    if not root then return out end
+    for _,need in ipairs(NEEDS) do
+        local c=findMoodTarget(need,root)
+        out[need.name]=c and {name=c.object.Name,label=c.label,distance=math.round(c.d),path=c.path} or false
+    end
+    return out
+end
 local function tickLoop()
     if not state.enabled then stopWalking() state.stage='paused' return end
     if input:GetFocusedTextBox() then releaseMouse() stopWalking() state.stage='typing' return end
+    if mood.phase~='idle' or mood.enabled then
+        local ok,owned=pcall(moodStep)
+        if not ok then
+            log('mood_error',tostring(owned)) mood.enabled=false moodCancel('error')
+        elseif owned then return end
+    end
     if not handler:IsWorking(teacher.Script) then
-        releaseMouse() stopWalking() state.pending=nil state.stage='waiting_for_teacher_shift' return
+        releaseMouse() stopWalking() state.pending=nil
+        local root=player.Character and player.Character:FindFirstChild('HumanoidRootPart')
+        if root and isAtHome(root) then
+            state.stage=mood.enabled and 'mood_idle_at_home' or 'at_home_waiting'
+        else
+            state.stage='waiting_for_teacher_shift'
+        end
+        return
     end
     local root=player.Character and player.Character:FindFirstChild('HumanoidRootPart')
     if not root then releaseMouse() stopWalking() state.stage='waiting_for_character' return end
@@ -318,7 +1076,7 @@ local function tickLoop()
     if line:IsRunning() then
         stopWalking()
         -- Only control a board game this loop started, never another minigame.
-        if state.pending and state.pending.label=='B_Interact' then
+        if state.pending and state.pending.label=='B_Interact' and state.stageOn.board then
             state.stage='tracing_board' traceBoard()
         else state.stage='waiting_for_manual_minigame' end
         return
@@ -399,6 +1157,12 @@ local function tickLoop()
             end
         end
     end
+    -- Hub filter: drop stages switched off, before the delivery priority below.
+    for _,list in ipairs({routes,candidates}) do
+        for i=#list,1,-1 do
+            if not state.stageOn[STAGE_OF[list[i].label]] then table.remove(list,i) end
+        end
+    end
     if hasPass then
         -- Scolding/board animations can unequip a pass. Complete the delivery
         -- stage before starting another action, including during its walk.
@@ -468,7 +1232,7 @@ local function tickLoop()
     state.targetDistance=nearestDistance<math.huge and math.round(nearestDistance*10)/10 or nil
     state.stage=nearestDistance<math.huge and 'waiting_for_native_action' or 'waiting_for_task'
 end
-log('started',state.version..' F8 pause / F9 stop')
+log('started',state.version..' hub')
 task.spawn(function()
     while state.alive and env.MesaTeacherLoop==state do
         local ok,err=xpcall(tickLoop,debug.traceback)
@@ -476,7 +1240,7 @@ task.spawn(function()
             releaseMouse() stopWalking() state.errors+=1 state.enabled=false state.stage='error_paused'
             log('error',tostring(err))
         end
-        task.wait(0.1)
+        task.wait(0.05)
     end
     releaseMouse() stopWalking()
 end)
